@@ -20,7 +20,7 @@ If you are new to neural networks, this ["Dummy's Guide"](https://x.com/hooeem/s
 
 ## Quick start
 
-**Requirements:** A single NVIDIA GPU (tested on H100), Python 3.10+, [uv](https://docs.astral.sh/uv/).
+**Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/). A single NVIDIA GPU (tested on H100) is still the default path, and an opt-in CPU-native BitNet proof of concept is now available for local experimentation.
 
 ```bash
 
@@ -35,6 +35,19 @@ uv run prepare.py
 
 # 4. Manually run a single training experiment (~5 min)
 uv run train.py
+
+# 5. Run the CPU-native BitNet proof of concept (~5 min fixed budget)
+OBJECTIVE="Minimize energy while maintaining accuracy"
+SIGNATURE="$(python - <<'PY'
+import hashlib, hmac
+objective = "Minimize energy while maintaining accuracy"
+print(hmac.new(b"demo", objective.encode(), hashlib.sha256).hexdigest())
+PY
+)"
+uv run train.py --device cpu --cpu-bitnet-poc \
+  --objective "$OBJECTIVE" \
+  --signature-secret demo \
+  --signature "$SIGNATURE"
 ```
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
@@ -66,7 +79,9 @@ pyproject.toml  — dependencies
 
 ## Platform support
 
-This code currently requires that you have a single NVIDIA GPU. In principle it is quite possible to support CPU, MPS and other platforms but this would also bloat the code. I'm not 100% sure that I want to take this on personally right now. People can reference (or have their agents reference) the full/parent nanochat repository that has wider platform support and shows the various solutions (e.g. a Flash Attention 3 kernels fallback implementation, generic device support, autodetection, etc.), feel free to create forks or discussions for other platforms and I'm happy to link to them here in the README in some new notable forks section or etc.
+The default training path is still aimed at a single NVIDIA GPU, but this repo now also includes an opt-in CPU-native BitNet PoC mode. The PoC uses ternary `BitLinear` layers, a generic scaled-dot-product-attention fallback, CPU-safe dataloading/evaluation, and optional signed objective verification so the 5-minute autoresearch loop can run without CUDA.
+
+To enable it, run `uv run train.py --device cpu --cpu-bitnet-poc`. Successful runs append PoC metrics to `results.tsv`, including device, linear implementation, signature status, estimated energy per token, and throughput.
 
 Seeing as there seems to be a lot of interest in tinkering with autoresearch on much smaller compute platforms than an H100, a few extra words. If you're going to try running autoresearch on smaller computers (Macbooks etc.), I'd recommend one of the forks below. On top of this, here are some recommendations for how to tune the defaults for much smaller models for aspiring forks:
 
