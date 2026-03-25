@@ -933,7 +933,7 @@ def run_training(args):
     print(f"val_bpb:          {val_bpb:.6f}")
     print(f"training_seconds: {total_training_time:.1f}")
     print(f"total_seconds:    {t_end - t_start:.1f}")
-    print(f"peak_vram_mb:     {peak_memory_mb:.1f}")
+    print(f"peak_mem_mb:      {peak_memory_mb:.1f}")
     print(f"mfu_percent:      {steady_state_mfu:.2f}")
     print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
     print(f"num_steps:        {step}")
