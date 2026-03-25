@@ -20,7 +20,7 @@ Once you get confirmation, kick off the experimentation.
 
 ## Experimentation
 
-Each experiment runs on a single GPU. The training script runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). You launch it simply as: `uv run train.py`.
+Each experiment runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). The default path is GPU-first (`uv run train.py`), and the CPU-native BitNet proof of concept runs as `uv run train.py --device cpu --cpu-bitnet-poc`.
 
 **What you CAN do:**
 - Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
@@ -65,11 +65,13 @@ grep "^val_bpb:" run.log
 
 When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
 
-The TSV has a header row and 5 columns:
+The TSV has a header row. The baseline format has 5 core columns:
 
 ```
 commit	val_bpb	memory_gb	status	description
 ```
+
+CPU-native BitNet PoC runs may append additional columns after these core fields to track the platform-specific success signatures: `device`, `linear_impl`, `signature_verified`, `energy_j_per_token`, and `tokens_per_second`.
 
 1. git commit hash (short, 7 chars)
 2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes

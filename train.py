@@ -8,20 +8,25 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
+import argparse
 import gc
+import hashlib
+import hmac
 import math
+import subprocess
+import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, asdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+try:
+    from kernels import get_kernel
+except ImportError:
+    get_kernel = None
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -38,6 +43,11 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    linear_impl: str = "dense"
+    bitlinear_scaling: str = "mean"
+    bitlinear_threshold: float = 0.5
+    use_subln: bool = False
+    device_type: str = "cuda"
 
 
 def norm(x):
@@ -58,6 +68,81 @@ def apply_rotary_emb(x, cos, sin):
     return torch.cat([y1, y2], 3)
 
 
+def ternary_quantize(weight, scaling="mean", threshold=0.5):
+    if scaling == "median":
+        scale = weight.detach().abs().median(dim=-1, keepdim=True).values
+    else:
+        scale = weight.detach().abs().mean(dim=-1, keepdim=True)
+    scale = scale.clamp_min(1e-6)
+    normalized = weight / scale
+    ternary = torch.where(
+        normalized > threshold,
+        torch.ones_like(normalized),
+        torch.where(normalized < -threshold, -torch.ones_like(normalized), torch.zeros_like(normalized)),
+    )
+    return weight + (ternary * scale - weight).detach()
+
+
+class BitLinear(nn.Linear):
+    def __init__(self, in_features, out_features, bias=False, scaling="mean", threshold=0.5):
+        super().__init__(in_features, out_features, bias=bias)
+        self.scaling = scaling
+        self.threshold = threshold
+
+    def ternary_weight(self):
+        return ternary_quantize(self.weight, scaling=self.scaling, threshold=self.threshold)
+
+    def forward(self, x):
+        return F.linear(x, self.ternary_weight(), self.bias)
+
+
+def make_linear(config, in_features, out_features, bias=False):
+    if config.linear_impl == "bitlinear":
+        return BitLinear(
+            in_features,
+            out_features,
+            bias=bias,
+            scaling=config.bitlinear_scaling,
+            threshold=config.bitlinear_threshold,
+        )
+    return nn.Linear(in_features, out_features, bias=bias)
+
+
+def build_sliding_window_mask(seq_len, window_size, device):
+    if not isinstance(window_size, (tuple, list)) or len(window_size) == 0:
+        raise ValueError("window_size must be a tuple/list like (window, offset).")
+    if window_size[0] < 0 or window_size[0] >= seq_len:
+        return None
+    positions = torch.arange(seq_len, device=device)
+    col = positions.unsqueeze(0)
+    row = positions.unsqueeze(1)
+    min_allowed = (row - window_size[0] + 1).clamp_min(0)
+    return (col >= min_allowed) & (col <= row)
+
+
+def scaled_dot_product_attention_fallback(q, k, v, window_size):
+    attn_mask = build_sliding_window_mask(q.size(1), window_size, q.device)
+    q = q.transpose(1, 2)
+    k = k.transpose(1, 2)
+    v = v.transpose(1, 2)
+    y = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, is_causal=attn_mask is None)
+    return y.transpose(1, 2)
+
+
+def load_flash_attention():
+    if get_kernel is None or not torch.cuda.is_available():
+        return None
+    cap = torch.cuda.get_device_capability()
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    try:
+        return get_kernel(repo).flash_attn_interface
+    except Exception:
+        return None
+
+
+FA3 = load_flash_attention()
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
@@ -67,12 +152,12 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = self.n_embd // self.n_head
         assert self.n_embd % self.n_head == 0
         assert self.n_kv_head <= self.n_head and self.n_head % self.n_kv_head == 0
-        self.c_q = nn.Linear(self.n_embd, self.n_head * self.head_dim, bias=False)
-        self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
+        self.c_q = make_linear(config, self.n_embd, self.n_head * self.head_dim, bias=False)
+        self.c_k = make_linear(config, self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_v = make_linear(config, self.n_embd, self.n_kv_head * self.head_dim, bias=False)
+        self.c_proj = make_linear(config, self.n_embd, self.n_embd, bias=False)
         self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
+        self.ve_gate = make_linear(config, self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
@@ -90,7 +175,10 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if FA3 is not None and x.is_cuda:
+            y = FA3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            y = scaled_dot_product_attention_fallback(q, k, v, window_size)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -99,8 +187,8 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.c_fc = make_linear(config, config.n_embd, 4 * config.n_embd, bias=False)
+        self.c_proj = make_linear(config, 4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -114,10 +202,17 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
+        self.use_subln = config.use_subln
 
     def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
-        x = x + self.mlp(norm(x))
+        attn_out = self.attn(norm(x), ve, cos_sin, window_size)
+        if self.use_subln:
+            attn_out = norm(attn_out)
+        x = x + attn_out
+        mlp_out = self.mlp(norm(x))
+        if self.use_subln:
+            mlp_out = norm(mlp_out)
+        x = x + mlp_out
         return x
 
 
@@ -130,7 +225,7 @@ class GPT(nn.Module):
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
             "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
         })
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = make_linear(config, config.n_embd, config.vocab_size, bias=False)
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
         # Value embeddings
@@ -175,10 +270,10 @@ class GPT(nn.Module):
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
-        # Cast embeddings to bf16
-        self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
+        if self.config.device_type == "cuda":
+            self.transformer.wte.to(dtype=torch.bfloat16)
+            for ve in self.value_embeds.values():
+                ve.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -254,12 +349,17 @@ class GPT(nn.Module):
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
+        if self.config.device_type != "cuda" or self.config.linear_impl == "bitlinear":
+            param_groups.append(
+                dict(kind='adamw', params=matrix_params, lr=matrix_lr, betas=adam_betas, eps=1e-10, weight_decay=weight_decay)
+            )
+        else:
+            for shape in sorted({p.shape for p in matrix_params}):
+                group_params = [p for p in matrix_params if p.shape == shape]
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
+                ))
         optimizer = MuonAdamW(param_groups)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
@@ -302,7 +402,16 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-@torch.compile(dynamic=False, fullgraph=True)
+def maybe_compile(fn):
+    if os.getenv("AUTORESEARCH_ENABLE_COMPILE", "1") != "1":
+        return fn
+    try:
+        return torch.compile(fn, dynamic=False, fullgraph=True)
+    except Exception:
+        return fn
+
+
+@maybe_compile
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
     p.mul_(1 - lr_t * wd_t)
     exp_avg.lerp_(grad, 1 - beta1_t)
@@ -313,7 +422,7 @@ def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_
     step_size = lr_t / bias1
     p.add_(exp_avg / denom, alpha=-step_size)
 
-@torch.compile(dynamic=False, fullgraph=True)
+@maybe_compile
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -451,16 +560,435 @@ DEPTH = 8               # number of transformer layers
 DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
-# Setup: tokenizer, model, optimizer, dataloader
+# CPU-native BitNet PoC defaults
 # ---------------------------------------------------------------------------
 
-t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
 H100_BF16_PEAK_FLOPS = 989.5e12
+CPU_POC_DEPTH = 4
+CPU_POC_DEVICE_BATCH_SIZE = 8
+CPU_POC_TOTAL_BATCH_SIZE = 2**14
+CPU_POC_WINDOW_PATTERN = "L"
+RESULTS_HEADER = (
+    "commit\tval_bpb\tmemory_gb\tstatus\tdescription\tdevice\tlinear_impl\t"
+    "signature_verified\tenergy_j_per_token\ttokens_per_second\n"
+)
+
+
+def detect_device(requested):
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    device = torch.device(requested)
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available.")
+    if device.type == "mps" and (not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available()):
+        raise RuntimeError("MPS was requested but is not available.")
+    return device
+
+
+def get_autocast_context(device):
+    if device.type == "cuda":
+        return torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return nullcontext()
+
+
+def synchronize_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def get_peak_memory_mb(device):
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated() / 1024 / 1024
+    if os.name == "nt":
+        import ctypes
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", ctypes.c_uint32),
+                ("PageFaultCount", ctypes.c_uint32),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        ok = ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb)
+        return counters.PeakWorkingSetSize / 1024 / 1024 if ok else 0.0
+    try:
+        import resource
+    except ImportError:
+        return 0.0
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "linux":
+        return rss / 1024
+    return rss / (1024 * 1024)
+
+
+def compute_objective_signature(objective, secret):
+    return hmac.new(secret.encode("utf-8"), objective.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def verify_objective_signature(objective, signature, secret, require_signature=False):
+    provided = any([objective, signature, secret])
+    if not require_signature and not provided:
+        return False
+    if not objective:
+        raise RuntimeError("An objective is required when signature verification is enabled.")
+    if not signature or not secret:
+        raise RuntimeError("Both a signature and signature secret are required when signature verification is enabled.")
+    expected = compute_objective_signature(objective, secret)
+    if not hmac.compare_digest(expected, signature.strip()):
+        raise RuntimeError("Objective signature verification failed.")
+    return True
+
+
+def ensure_results_tsv(path):
+    if not path:
+        return
+    if not os.path.exists(path):
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(RESULTS_HEADER)
+
+
+def append_results_tsv(path, metrics):
+    if not path:
+        return
+    ensure_results_tsv(path)
+    description = metrics["description"].replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    row = [
+        metrics["commit"],
+        f"{metrics['val_bpb']:.6f}",
+        f"{metrics['memory_gb']:.1f}",
+        metrics["status"],
+        description,
+        metrics["device"],
+        metrics["linear_impl"],
+        "yes" if metrics["signature_verified"] else "no",
+        f"{metrics['energy_j_per_token']:.9f}",
+        f"{metrics['tokens_per_second']:.1f}",
+    ]
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\t".join(row) + "\n")
+
+
+def get_git_commit():
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def maybe_compile_model(model, device):
+    if device.type != "cuda" or os.getenv("AUTORESEARCH_ENABLE_COMPILE", "1") != "1":
+        return model
+    try:
+        return torch.compile(model, dynamic=False)
+    except Exception:
+        return model
+
+
+def build_model_config(depth, vocab_size, device, linear_impl, bitlinear_scaling, use_subln, window_pattern):
+    base_dim = depth * ASPECT_RATIO
+    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
+    num_heads = model_dim // HEAD_DIM
+    return GPTConfig(
+        sequence_len=MAX_SEQ_LEN,
+        vocab_size=vocab_size,
+        n_layer=depth,
+        n_head=num_heads,
+        n_kv_head=num_heads,
+        n_embd=model_dim,
+        window_pattern=window_pattern,
+        linear_impl=linear_impl,
+        bitlinear_scaling=bitlinear_scaling,
+        use_subln=use_subln,
+        device_type=device.type,
+    )
+
+
+def get_lr_multiplier(progress):
+    if progress < WARMUP_RATIO:
+        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
+    if progress < 1.0 - WARMDOWN_RATIO:
+        return 1.0
+    cooldown = (1.0 - progress) / WARMDOWN_RATIO
+    return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+
+
+def get_muon_momentum(step):
+    frac = min(step / 300, 1)
+    return (1 - frac) * 0.85 + frac * 0.95
+
+
+def get_weight_decay(progress):
+    return WEIGHT_DECAY * (1 - progress)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train autoresearch models on GPU or in CPU-native BitNet PoC mode")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default=os.getenv("AUTORESEARCH_DEVICE", "auto"))
+    parser.add_argument("--cpu-bitnet-poc", action="store_true", default=os.getenv("AUTORESEARCH_CPU_BITNET_POC", "0") == "1")
+    parser.add_argument("--linear-impl", choices=["dense", "bitlinear"], default=os.getenv("AUTORESEARCH_LINEAR_IMPL", "dense"))
+    parser.add_argument("--bitlinear-scaling", choices=["mean", "median"], default=os.getenv("AUTORESEARCH_BITLINEAR_SCALING", "mean"))
+    parser.add_argument("--use-subln", action="store_true", default=os.getenv("AUTORESEARCH_USE_SUBLN", "0") == "1")
+    parser.add_argument("--results-tsv", default=os.getenv("AUTORESEARCH_RESULTS_TSV", "results.tsv"))
+    parser.add_argument("--status", default=os.getenv("AUTORESEARCH_RUN_STATUS", "candidate"))
+    parser.add_argument("--description", default=os.getenv("AUTORESEARCH_RUN_DESCRIPTION", ""))
+    parser.add_argument("--avg-power-watts", type=float, default=float(os.getenv("AUTORESEARCH_AVG_POWER_WATTS", "15.0")))
+    parser.add_argument("--objective", default=os.getenv("AUTORESEARCH_OBJECTIVE", ""))
+    parser.add_argument("--signature", default=os.getenv("AUTORESEARCH_OBJECTIVE_SIGNATURE", ""))
+    parser.add_argument("--signature-secret", default=os.getenv("AUTORESEARCH_SIGNATURE_SECRET", ""))
+    parser.add_argument("--require-signature", action="store_true", default=os.getenv("AUTORESEARCH_REQUIRE_SIGNATURE", "0") == "1")
+    return parser.parse_args()
+
+
+def run_training(args):
+    t_start = time.time()
+    device = detect_device(args.device)
+    torch.manual_seed(42)
+    if device.type == "cuda":
+        torch.cuda.manual_seed(42)
+        torch.cuda.reset_peak_memory_stats()
+    torch.set_float32_matmul_precision("high")
+    autocast_ctx = get_autocast_context(device)
+    signature_verified = verify_objective_signature(
+        args.objective,
+        args.signature,
+        args.signature_secret,
+        require_signature=args.require_signature,
+    )
+
+    linear_impl = args.linear_impl
+    bitlinear_scaling = args.bitlinear_scaling
+    use_subln = args.use_subln
+    depth = DEPTH
+    device_batch_size = DEVICE_BATCH_SIZE
+    total_batch_size = TOTAL_BATCH_SIZE
+    window_pattern = WINDOW_PATTERN
+    description = args.description or "baseline"
+
+    if args.cpu_bitnet_poc:
+        linear_impl = "bitlinear"
+        use_subln = True
+        depth = CPU_POC_DEPTH
+        device_batch_size = CPU_POC_DEVICE_BATCH_SIZE
+        total_batch_size = CPU_POC_TOTAL_BATCH_SIZE
+        window_pattern = CPU_POC_WINDOW_PATTERN
+        if not args.description:
+            description = "cpu bitnet poc"
+
+    tokenizer = Tokenizer.from_directory()
+    vocab_size = tokenizer.get_vocab_size()
+    print(f"Vocab size: {vocab_size:,}")
+
+    config = build_model_config(
+        depth=depth,
+        vocab_size=vocab_size,
+        device=device,
+        linear_impl=linear_impl,
+        bitlinear_scaling=bitlinear_scaling,
+        use_subln=use_subln,
+        window_pattern=window_pattern,
+    )
+    print(f"Model config: {asdict(config)}")
+
+    with torch.device("meta"):
+        model = GPT(config)
+    model.to_empty(device=device)
+    model.init_weights()
+
+    param_counts = model.num_scaling_params()
+    print("Parameter counts:")
+    for key, value in param_counts.items():
+        print(f"  {key:24s}: {value:,}")
+    num_params = param_counts["total"]
+    num_flops_per_token = model.estimate_flops()
+    print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
+
+    tokens_per_fwdbwd = device_batch_size * MAX_SEQ_LEN
+    assert total_batch_size % tokens_per_fwdbwd == 0
+    grad_accum_steps = total_batch_size // tokens_per_fwdbwd
+
+    optimizer = model.setup_optimizer(
+        unembedding_lr=UNEMBEDDING_LR,
+        embedding_lr=EMBEDDING_LR,
+        scalar_lr=SCALAR_LR,
+        adam_betas=ADAM_BETAS,
+        matrix_lr=MATRIX_LR,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    model = maybe_compile_model(model, device)
+    train_loader = make_dataloader(tokenizer, device_batch_size, MAX_SEQ_LEN, "train", device=device)
+    x, y, epoch = next(train_loader)
+
+    print(f"Device: {device}")
+    print(f"Time budget: {TIME_BUDGET}s")
+    print(f"Gradient accumulation steps: {grad_accum_steps}")
+    if args.objective:
+        print(f"Objective: {args.objective}")
+        print(f"Objective signature verified: {signature_verified}")
+
+    t_start_training = time.time()
+    smooth_train_loss = 0
+    total_training_time = 0
+    step = 0
+
+    while True:
+        synchronize_device(device)
+        t0 = time.time()
+        for _ in range(grad_accum_steps):
+            with autocast_ctx:
+                loss = model(x, y)
+            train_loss = loss.detach()
+            loss = loss / grad_accum_steps
+            loss.backward()
+            x, y, epoch = next(train_loader)
+
+        progress = min(total_training_time / TIME_BUDGET, 1.0)
+        lrm = get_lr_multiplier(progress)
+        muon_momentum = get_muon_momentum(step)
+        muon_weight_decay = get_weight_decay(progress)
+        for group in optimizer.param_groups:
+            group["lr"] = group["initial_lr"] * lrm
+            if group["kind"] == "muon":
+                group["momentum"] = muon_momentum
+                group["weight_decay"] = muon_weight_decay
+        optimizer.step()
+        model.zero_grad(set_to_none=True)
+
+        train_loss_f = train_loss.item()
+        if math.isnan(train_loss_f) or train_loss_f > 100:
+            raise RuntimeError("Training diverged.")
+
+        synchronize_device(device)
+        t1 = time.time()
+        dt = t1 - t0
+
+        if step > 10:
+            total_training_time += dt
+
+        ema_beta = 0.9
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
+        pct_done = 100 * progress
+        tok_per_sec = int(total_batch_size / max(dt, 1e-9))
+        mfu = 100 * num_flops_per_token * total_batch_size / dt / H100_BF16_PEAK_FLOPS if device.type == "cuda" else 0.0
+        remaining = max(0, TIME_BUDGET - total_training_time)
+
+        print(
+            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
+            f"lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
+            f"mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
+            end="",
+            flush=True,
+        )
+
+        if step == 0:
+            gc.collect()
+            gc.freeze()
+            gc.disable()
+        elif (step + 1) % 5000 == 0:
+            gc.collect()
+
+        step += 1
+        if step > 10 and total_training_time >= TIME_BUDGET:
+            break
+
+    print()
+    total_tokens = step * total_batch_size
+
+    model.eval()
+    with autocast_ctx:
+        val_bpb = evaluate_bpb(model, tokenizer, device_batch_size, device=device)
+
+    t_end = time.time()
+    steady_state_mfu = (
+        100 * num_flops_per_token * total_batch_size * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS
+        if device.type == "cuda" and total_training_time > 0
+        else 0.0
+    )
+    peak_memory_mb = get_peak_memory_mb(device)
+    energy_j_per_token = args.avg_power_watts * total_training_time / max(total_tokens, 1)
+    tokens_per_second = total_tokens / max(total_training_time, 1e-9)
+
+    print("---")
+    print(f"val_bpb:          {val_bpb:.6f}")
+    print(f"training_seconds: {total_training_time:.1f}")
+    print(f"total_seconds:    {t_end - t_start:.1f}")
+    print(f"peak_mem_mb:      {peak_memory_mb:.1f}")
+    print(f"mfu_percent:      {steady_state_mfu:.2f}")
+    print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
+    print(f"num_steps:        {step}")
+    print(f"num_params_M:     {num_params / 1e6:.1f}")
+    print(f"depth:            {depth}")
+    print(f"device:           {device.type}")
+    print(f"linear_impl:      {linear_impl}")
+    print(f"energy_j/token:   {energy_j_per_token:.9f}")
+    print(f"tokens_per_sec:   {tokens_per_second:.1f}")
+    print(f"signature_ok:     {signature_verified}")
+
+    return {
+        "commit": get_git_commit(),
+        "val_bpb": val_bpb,
+        "memory_gb": peak_memory_mb / 1024,
+        "status": args.status,
+        "description": description,
+        "device": device.type,
+        "linear_impl": linear_impl,
+        "signature_verified": signature_verified,
+        "energy_j_per_token": energy_j_per_token,
+        "tokens_per_second": tokens_per_second,
+    }
+
+
+def main():
+    args = parse_args()
+    ensure_results_tsv(args.results_tsv)
+    try:
+        metrics = run_training(args)
+    except Exception:
+        failure_linear_impl = "bitlinear" if args.cpu_bitnet_poc else args.linear_impl
+        failure_description = args.description or ("cpu bitnet poc" if args.cpu_bitnet_poc else "run crashed")
+        if args.results_tsv:
+            append_results_tsv(
+                args.results_tsv,
+                {
+                    "commit": get_git_commit(),
+                    "val_bpb": 0.0,
+                    "memory_gb": 0.0,
+                    "status": "crash",
+                    "description": failure_description,
+                    "device": args.device,
+                    "linear_impl": failure_linear_impl,
+                    "signature_verified": False,
+                    "energy_j_per_token": 0.0,
+                    "tokens_per_second": 0.0,
+                },
+            )
+        raise
+    append_results_tsv(args.results_tsv, metrics)
+
+
+if __name__ == "__main__":
+    main()
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
