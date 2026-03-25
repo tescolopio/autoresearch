@@ -109,6 +109,8 @@ def make_linear(config, in_features, out_features, bias=False):
 
 
 def build_sliding_window_mask(seq_len, window_size, device):
+    if not isinstance(window_size, (tuple, list)) or len(window_size) == 0:
+        raise ValueError("window_size must be a tuple/list like (window, offset).")
     if window_size[0] < 0 or window_size[0] >= seq_len:
         return None
     positions = torch.arange(seq_len, device=device)
@@ -628,7 +630,9 @@ def get_peak_memory_mb(device):
     except ImportError:
         return 0.0
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return rss / (1024 * 1024) if sys.platform == "darwin" else rss / 1024
+    if sys.platform == "linux":
+        return rss / 1024
+    return rss / (1024 * 1024)
 
 
 def compute_objective_signature(objective, secret):
@@ -636,7 +640,8 @@ def compute_objective_signature(objective, secret):
 
 
 def verify_objective_signature(objective, signature, secret, require_signature=False):
-    if not (require_signature or signature or secret or objective):
+    provided = any([objective, signature, secret])
+    if not require_signature and not provided:
         return False
     if not objective:
         raise RuntimeError("An objective is required when signature verification is enabled.")
@@ -660,12 +665,13 @@ def append_results_tsv(path, metrics):
     if not path:
         return
     ensure_results_tsv(path)
+    description = metrics["description"].replace("\t", " ").replace("\r", " ").replace("\n", " ")
     row = [
         metrics["commit"],
         f"{metrics['val_bpb']:.6f}",
         f"{metrics['memory_gb']:.1f}",
         metrics["status"],
-        metrics["description"].replace("\t", " "),
+        description,
         metrics["device"],
         metrics["linear_impl"],
         "yes" if metrics["signature_verified"] else "no",
