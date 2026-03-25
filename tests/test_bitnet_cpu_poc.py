@@ -9,6 +9,7 @@ import unittest
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 TRAIN_PATH = REPO_ROOT / "train.py"
 PREPARE_PATH = REPO_ROOT / "prepare.py"
+README_PATH = REPO_ROOT / "README.md"
 
 
 def load_train_symbols():
@@ -46,6 +47,7 @@ class BitNetCpuPocTests(unittest.TestCase):
         cls.train = load_train_symbols()
         cls.train_source = TRAIN_PATH.read_text(encoding="utf-8")
         cls.prepare_source = PREPARE_PATH.read_text(encoding="utf-8")
+        cls.readme_source = README_PATH.read_text(encoding="utf-8")
         cls.train_tree = ast.parse(cls.train_source, filename=str(TRAIN_PATH))
         cls.prepare_tree = ast.parse(cls.prepare_source, filename=str(PREPARE_PATH))
 
@@ -111,6 +113,14 @@ class BitNetCpuPocTests(unittest.TestCase):
             self.assertNotIn("\n", lines[1])
             self.assertNotIn("\tbitnet", lines[1])
             self.assertNotIn("\r", lines[1])
+
+    def test_readme_documents_poc_validation_expectations(self):
+        self.assertIn("## CPU BitNet PoC validation", self.readme_source)
+        self.assertIn("python -m unittest tests/test_bitnet_cpu_poc.py", self.readme_source)
+        self.assertIn("What a successful PoC must show", self.readme_source)
+        self.assertIn("device:           cpu", self.readme_source)
+        self.assertIn("linear_impl:      bitlinear", self.readme_source)
+        self.assertIn("signature_ok:     True", self.readme_source)
 
 
 if __name__ == "__main__":

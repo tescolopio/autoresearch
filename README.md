@@ -52,6 +52,84 @@ uv run train.py --device cpu --cpu-bitnet-poc \
 
 If the above commands all work ok, your setup is working and you can go into autonomous research mode.
 
+## CPU BitNet PoC validation
+
+If you want to show that the CPU-native BitNet proof of concept is working, use the following validation flow.
+
+### 1. Automated checks
+
+Run the existing focused checks first:
+
+```bash
+python -m unittest tests/test_bitnet_cpu_poc.py
+python -m py_compile train.py prepare.py tests/test_bitnet_cpu_poc.py
+```
+
+These checks verify that the CPU PoC entrypoints, signature verification, `results.tsv` logging, and CPU-safe data/eval hooks are still present.
+
+### 2. Manual PoC run
+
+Run one signed 5-minute CPU PoC experiment:
+
+```bash
+OBJECTIVE="Minimize energy while maintaining accuracy"
+SIGNATURE="$(python - <<'PY'
+import hashlib, hmac
+objective = "Minimize energy while maintaining accuracy"
+print(hmac.new(b"demo", objective.encode(), hashlib.sha256).hexdigest())
+PY
+)"
+
+uv run train.py \
+  --device cpu \
+  --cpu-bitnet-poc \
+  --objective "$OBJECTIVE" \
+  --signature-secret demo \
+  --signature "$SIGNATURE"
+```
+
+### 3. What a successful PoC must show
+
+Treat the PoC as successful if all of the following are true:
+
+1. The run completes its fixed 5-minute training budget without crashing.
+2. The summary output includes:
+   - `val_bpb`
+   - `device:           cpu`
+   - `linear_impl:      bitlinear`
+   - `energy_j/token`
+   - `tokens_per_sec`
+   - `signature_ok:     True`
+3. `results.tsv` gets a new row with the CPU PoC metadata columns populated:
+   - `device`
+   - `linear_impl`
+   - `signature_verified`
+   - `energy_j_per_token`
+   - `tokens_per_second`
+4. The recorded row shows the CPU path was actually exercised:
+   - `device=cpu`
+   - `linear_impl=bitlinear`
+   - `signature_verified=yes`
+
+### 4. Expectations for this proof of concept
+
+This PoC is intended to prove **capability**, not to promise a fixed benchmark win on every machine.
+
+The concrete expectation is:
+
+- the autoresearch loop can run on CPU,
+- ternary BitLinear mode is actually selected,
+- signed objectives can gate execution,
+- and the run produces measurable PoC outputs in both stdout and `results.tsv`.
+
+Nice-to-have follow-up evidence is to compare the CPU BitNet run with a dense CPU baseline such as:
+
+```bash
+uv run train.py --device cpu --linear-impl dense
+```
+
+That comparison can help you judge relative energy and throughput on your machine, but it is **not required** to demonstrate that the PoC itself exists and works.
+
 ## Running the agent
 
 Simply spin up your Claude/Codex or whatever you want in this repo (and disable all permissions), then you can prompt something like:
