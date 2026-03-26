@@ -1,116 +1,234 @@
 # autoresearch
 
-This is an experiment to have the LLM do its own research.
+This is a CPU-native BitNet research contract for a local autonomous agent.
 
-## Setup
+The end goal is not generic model tinkering. The end goal is to improve a local model on a defined target task through repeatable 5-minute CPU experiments, while preserving local-only execution and clear keep or discard decisions.
 
-To set up a new experiment, work with the user to:
+## Mission
 
-1. **Agree on a run tag**: propose a tag based on today's date (e.g. `mar5`). The branch `autoresearch/<tag>` must not already exist — this is a fresh run.
-2. **Create the branch**: `git checkout -b autoresearch/<tag>` from current master.
-3. **Read the in-scope files**: The repo is small. Read these files for full context:
-   - `README.md` — repository context.
-   - `prepare.py` — fixed constants, data prep, tokenizer, dataloader, evaluation. Do not modify.
-   - `train.py` — the file you modify. Model architecture, optimizer, training loop.
-4. **Verify data exists**: Check that `~/.cache/autoresearch/` contains data shards and a tokenizer. If not, tell the human to run `uv run prepare.py`.
-5. **Initialize results.tsv**: Create `results.tsv` with just the header row. The baseline will be recorded after the first run.
-6. **Confirm and go**: Confirm setup looks good.
+You are operating a local BitNet research loop.
 
-Once you get confirmation, kick off the experimentation.
+Your mission is to:
 
-## Experimentation
+1. establish a real CPU-native baseline
+2. improve the model on the current target task through iterative experiments
+3. keep only changes that improve the measured objective
+4. preserve local-only, CPU-only execution unless the human explicitly asks for a comparison baseline
 
-Each experiment runs for a **fixed time budget of 5 minutes** (wall clock training time, excluding startup/compilation). The default path is GPU-first (`uv run train.py`), and the CPU-native BitNet proof of concept runs as `uv run train.py --device cpu --cpu-bitnet-poc`.
+## Hard constraints
 
-**What you CAN do:**
-- Modify `train.py` — this is the only file you edit. Everything is fair game: model architecture, optimizer, hyperparameters, training loop, batch size, model size, etc.
+You must follow these constraints at all times:
 
-**What you CANNOT do:**
-- Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
-- Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+- default to CPU-native execution
+- treat BitNet mode as the required local path
+- do not rely on cloud training or remote compute
+- do not modify `prepare.py`
+- do not add new dependencies unless the human explicitly asks for them
+- do not change the evaluation harness in `prepare.py`
+- do not start long unattended loops until readiness milestones are satisfied
 
-**The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
+## Readiness gate before real experimentation
 
-**VRAM** is a soft constraint. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
+Before running the real loop, confirm that all of the following are true:
 
-**Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a great outcome — that's a simplification win. When evaluating whether to keep a change, weigh the complexity cost against the improvement magnitude. A 0.001 val_bpb improvement that adds 20 lines of hacky code? Probably not worth it. A 0.001 val_bpb improvement from deleting code? Definitely keep. An improvement of ~0 but much simpler code? Keep.
+1. the local environment is reproducible
+2. the first local agent can be deployed
+3. the tokenizer and data cache exist under `~/.cache/autoresearch/`
+4. one real CPU BitNet training run completes successfully
+5. one task-specific evaluation path exists
 
-**The first run**: Your very first run should always be to establish the baseline, so you will run the training script as is.
+If any of these are not true, stop the full loop and work only on closing the missing readiness gap.
 
-## Output format
+Use [ROADMAP.md](/mnt/d/source/3D-Tech-Solutions/autoresearch/ROADMAP.md) as the authority for readiness milestones.
 
-Once the script finishes it prints a summary like this:
+## In-scope files
 
+Read these files before making decisions:
+
+- `README.md`
+- `ROADMAP.md`
+- `prepare.py`
+- `train.py`
+- `program.md`
+
+You may also read:
+
+- `ternary_lab.py`
+- `deploy_cpu_agent.py`
+- `benchmark_compare.py`
+- `provider_benchmark.py`
+
+## Primary objective
+
+The optimization target has two layers:
+
+1. local training quality: improve `val_bpb`
+2. task usefulness: improve the current task-specific evaluation suite once it exists
+
+If there is a conflict, prefer the metric that directly reflects the user’s target task.
+
+Until a task-specific evaluation suite is fully established, use `val_bpb` as the temporary optimization anchor.
+
+## Setup protocol
+
+When starting a new real experiment run:
+
+1. agree on a run tag and create a dedicated branch such as `autoresearch/<tag>` when git is available
+2. confirm the current branch and git status
+3. confirm readiness milestones are satisfied
+4. confirm data and tokenizer artifacts exist
+5. confirm `results.tsv` exists or initialize it
+6. confirm the current best baseline metrics
+
+If the data cache is missing, do not pretend experimentation can begin. Tell the human the real loop is blocked on `python prepare.py`.
+
+When git is available, prefer the non-interactive helper commands in `scripts/git_agent.py` instead of ad hoc shell composition.
+
+## Useful workflow preserved from the original repo
+
+The original autoresearch workflow had several good operational habits. Keep them.
+
+- use a dedicated feature branch for a run instead of experimenting on an arbitrary branch
+- inspect git state before each experiment
+- make one intentional change per experiment
+- commit experiment code before running a real trial when the change is worth preserving in history
+- capture run output to a log file instead of flooding the agent context
+- append experiment results to `results.tsv`
+- keep successful changes and discard unsuccessful ones
+
+These workflow mechanics are still valid on the BitNet path. The difference is that the default execution target is now CPU-native BitNet, not GPU-first training.
+
+Preferred git helper patterns:
+
+```bash
+python scripts/git_agent.py status
+python scripts/git_agent.py ensure-branch --tag <run-tag>
+python scripts/git_agent.py commit --message "experiment: <summary>" --paths train.py
+python scripts/git_agent.py revert --commit <sha>
 ```
----
-val_bpb:          0.997900
-training_seconds: 300.1
-total_seconds:    325.9
-peak_vram_mb:     45060.2
-mfu_percent:      39.80
-total_tokens_M:   499.6
-num_steps:        953
-num_params_M:     50.3
-depth:            8
+
+For one real experiment with branch setup, commit, log capture, and optional automatic revert, prefer:
+
+```bash
+python scripts/run_agent_experiment.py \
+   --branch-tag <run-tag> \
+   --commit-message "experiment: <summary>" \
+   --commit-paths train.py \
+   --log-path .ternary_lab/runs/<run-tag>.log \
+   --revert-on-failure \
+   -- python train.py --device cpu --cpu-only --cpu-bitnet-poc
 ```
 
-Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
+## Allowed experimentation surface
 
-```
-grep "^val_bpb:" run.log
-```
+You may modify:
 
-## Logging results
+- `train.py`
 
-When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-separated — commas break in descriptions).
+You may use:
 
-The TSV has a header row. The baseline format has 5 core columns:
+- `ternary_lab.py` for orchestrated local runs
+- `deploy_cpu_agent.py` for agent lifecycle setup
+- `benchmark_compare.py` and `provider_benchmark.py` for evidence and validation
 
-```
-commit	val_bpb	memory_gb	status	description
-```
+Treat `provider_benchmark.py` as a separate showcase loop for demonstrating the system against frontier APIs. It is not the authority for `keep` or `discard` decisions in the main local research loop.
 
-CPU-native BitNet PoC runs may append additional columns after these core fields to track the platform-specific success signatures: `device`, `linear_impl`, `signature_verified`, `energy_j_per_token`, and `tokens_per_second`.
+You may not modify:
 
-1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
-3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
-4. status: `keep`, `discard`, or `crash`
-5. short text description of what this experiment tried
+- `prepare.py`
 
-Example:
+## CPU-first execution rules
 
-```
-commit	val_bpb	memory_gb	status	description
-a1b2c3d	0.997900	44.0	keep	baseline
-b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
-c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
-d4e5f6g	0.000000	0.0	crash	double model width (OOM)
+For local BitNet research, the default execution path is:
+
+```bash
+python train.py --device cpu --cpu-only --cpu-bitnet-poc
 ```
 
-## The experiment loop
+Use GPU only when explicitly collecting a comparison baseline, not as the default research path.
 
-The experiment runs on a dedicated branch (e.g. `autoresearch/mar5` or `autoresearch/mar5-gpu0`).
+## Experiment loop
 
-LOOP FOREVER:
+Once readiness is satisfied and a real loop is authorized, iterate as follows:
 
-1. Look at the git state: the current branch/commit we're on
-2. Tune `train.py` with an experimental idea by directly hacking the code.
-3. git commit
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything — do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
-6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
-7. Record the results in the tsv (NOTE: do not commit the results.tsv file, leave it untracked by git)
-8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
-9. If val_bpb is equal or worse, you git reset back to where you started
+1. inspect the current best result in `results.tsv`
+2. inspect git status and confirm you understand the current branch state
+3. propose one small, defensible change to `train.py`
+4. record the intent of the experiment in the description field
+5. if the change is a real candidate, create a non-interactive git commit before the run
+6. run one fixed 5-minute training experiment and redirect output to a log file when operating autonomously
+7. capture:
+   - `val_bpb`
+   - `tokens_per_second`
+   - `energy_j_per_token`
+   - CPU and GPU utilization metrics if present
+   - memory footprint
+8. decide `keep`, `discard`, or `crash`
+9. update `results.tsv`
+10. if the result is worse, revert only the experiment change and never destroy unrelated work
+11. continue only if the system remains stable
 
-The idea is that you are a completely autonomous researcher trying things out. If they work, keep. If they don't, discard. And you're advancing the branch so that you can iterate. If you feel like you're getting stuck in some way, you can rewind but you should probably do this very very sparingly (if ever).
+When running autonomously, prefer a log capture pattern equivalent to:
 
-**Timeout**: Each experiment should take ~5 minutes total (+ a few seconds for startup and eval overhead). If a run exceeds 10 minutes, kill it and treat it as a failure (discard and revert).
+```bash
+python train.py ... > run.log 2>&1
+```
 
-**Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix (e.g. a typo, a missing import), fix it and re-run. If the idea itself is fundamentally broken, just skip it, log "crash" as the status in the tsv, and move on.
+Then read the summary or failure trace from the log instead of streaming the entire run into the working context.
 
-**NEVER STOP**: Once the experiment loop has begun (after the initial setup), do NOT pause to ask the human if you should continue. Do NOT ask "should I keep going?" or "is this a good stopping point?". The human might be asleep, or gone from a computer and expects you to continue working *indefinitely* until you are manually stopped. You are autonomous. If you run out of ideas, think harder — read papers referenced in the code, re-read the in-scope files for new angles, try combining previous near-misses, try more radical architectural changes. The loop runs until the human interrupts you, period.
+## Keep and discard rules
 
-As an example use case, a user might leave you running while they sleep. If each experiment takes you ~5 minutes then you can run approx 12/hour, for a total of about 100 over the duration of the average human sleep. The user then wakes up to experimental results, all completed by you while they slept!
+Use these rules when judging a result:
+
+- `keep` if the local task-evaluation signal or other target metric improves meaningfully and the change is not needlessly complex
+- `discard` if the result is worse or equal without a compelling simplification win
+- `crash` if the run fails, times out, or produces invalid metrics
+
+Prefer simpler code when improvement is marginal.
+
+## Stability rules for unattended execution
+
+Do not start an overnight run until:
+
+- one real iteration succeeds
+- three unattended real iterations succeed
+- state files remain valid
+- result logging remains valid
+
+If those conditions are not met, continue local burn-in only.
+
+At any time, the human may pause, resume, or retarget the loop through `.ternary_lab/control.json` or `python scripts/loop_status.py`. Respect that control point before starting the next iteration.
+
+## Output expectations
+
+Every real run should yield a summary containing at least:
+
+- `val_bpb`
+- `training_seconds`
+- `total_seconds`
+- `tokens_per_sec`
+- `energy_j/token`
+- device and linear implementation
+
+If the run is on CPU, the summary should make that explicit.
+
+## What success looks like
+
+The loop is working correctly when:
+
+- local setup is reproducible
+- data and tokenizer are present
+- real CPU BitNet training runs complete consistently
+- results are appended cleanly to `results.tsv`
+- the agent can complete repeated keep or discard decisions without supervision
+
+## What not to claim
+
+Do not claim any of the following unless directly measured in this repository:
+
+- frontier-model parity
+- broad benchmark parity
+- 70B or 100B local deployment results
+- overnight scientific improvement if the loop has not actually completed one
+
+Stick to measured local evidence.

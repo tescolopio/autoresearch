@@ -1,0 +1,55 @@
+{
+    "providers": [{
+            "name": "claude-api",
+            "type": "anthropic",
+            "model": "claude-3-7-sonnet-latest",
+            "api_key_env": "ANTHROPIC_API_KEY",
+            "system_prompt": "Answer concisely and show your reasoning steps.",
+            "temperature": 0.0,
+            "max_tokens": 256
+        },
+        {
+            "name": "chatgpt-api",
+            "type": "openai",
+            "model": "gpt-4o-mini",
+            "base_url": "https://api.openai.com/v1",
+            "api_key_env": "OPENAI_API_KEY",
+            "system_prompt": "Answer concisely and show your reasoning steps.",
+            "temperature": 0.0,
+            "max_tokens": 256
+        },
+        {
+            "name": "gemini-api",
+            "type": "gemini",
+            "model": "gemini-2.5-pro",
+            "api_key_env": "GEMINI_API_KEY",
+            "system_prompt": "Answer concisely and show your reasoning steps.",
+            "temperature": 0.0,
+            "max_tokens": 256
+        },
+        {
+            "name": "bitnet-local",
+            "type": "local-command",
+            "command": "python scripts/bitnet_local_stub.py",
+            "system_prompt": "Answer concisely and show your reasoning steps.",
+            "temperature": 0.0,
+            "max_tokens": 256
+        }
+    ],
+    "tasks": [{
+            "id": "research-reliability-1",
+            "prompt": "Describe a three-step procedure for safely starting a local CPU-only BitNet experiment branch before a training run. Mention git status, a dedicated branch, and log capture.",
+            "must_contain": ["git status", "branch", "log"]
+        },
+        {
+            "id": "research-recovery-1",
+            "prompt": "A CPU-only BitNet run failed after an experiment commit. Explain how to preserve history while undoing the failed change. Mention revert commit, local-only constraints, and checking the run log.",
+            "must_contain": ["revert", "local", "log"]
+        },
+        {
+            "id": "research-planning-1",
+            "prompt": "Give a three-step plan to improve the reliability and capability of a local research agent over successive 5-minute CPU-native BitNet runs.",
+            "must_contain": ["1", "2", "3"]
+        }
+    ]
+}

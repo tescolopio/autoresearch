@@ -12,9 +12,12 @@ import argparse
 import gc
 import hashlib
 import hmac
+import json
 import math
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from contextlib import nullcontext
 from dataclasses import dataclass, asdict
@@ -568,9 +571,11 @@ CPU_POC_DEPTH = 4
 CPU_POC_DEVICE_BATCH_SIZE = 8
 CPU_POC_TOTAL_BATCH_SIZE = 2**14
 CPU_POC_WINDOW_PATTERN = "L"
+CPU_POC_EVAL_TOKENS = 2**18
 RESULTS_HEADER = (
     "commit\tval_bpb\tmemory_gb\tstatus\tdescription\tdevice\tlinear_impl\t"
-    "signature_verified\tenergy_j_per_token\ttokens_per_second\n"
+    "signature_verified\tenergy_j_per_token\ttokens_per_second\t"
+    "avg_cpu_process_percent\tavg_cpu_load_percent\tavg_gpu_util_percent\tavg_gpu_mem_used_mb\n"
 )
 
 
@@ -587,6 +592,110 @@ def detect_device(requested):
     if device.type == "mps" and (not hasattr(torch.backends, "mps") or not torch.backends.mps.is_available()):
         raise RuntimeError("MPS was requested but is not available.")
     return device
+
+
+def enforce_cpu_only(device, cpu_only):
+    if cpu_only and device.type != "cpu":
+        raise RuntimeError("This Ternary Lab configuration is CPU-only. Set --cpu-only=0 via env if you need an override.")
+
+
+class RuntimeSampler:
+    def __init__(self, device, interval=2.0):
+        self.device = device
+        self.interval = interval
+        self._stop = threading.Event()
+        self._thread = None
+        self.samples = []
+        self._last_wall = None
+        self._last_process = None
+        self._cpu_count = max(os.cpu_count() or 1, 1)
+        self._has_nvidia_smi = shutil.which("nvidia-smi") is not None
+
+    def start(self):
+        self._last_wall = time.time()
+        self._last_process = time.process_time()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if self._thread is None:
+            return self.summary()
+        self._stop.set()
+        self._thread.join(timeout=self.interval + 1.0)
+        return self.summary()
+
+    def _run(self):
+        while not self._stop.is_set():
+            self._sample_once()
+            self._stop.wait(self.interval)
+        self._sample_once()
+
+    def _sample_once(self):
+        now_wall = time.time()
+        now_process = time.process_time()
+        wall_dt = max(now_wall - (self._last_wall or now_wall), 1e-9)
+        proc_dt = max(now_process - (self._last_process or now_process), 0.0)
+        cpu_process_percent = 100.0 * proc_dt / (wall_dt * self._cpu_count)
+        self._last_wall = now_wall
+        self._last_process = now_process
+
+        cpu_load_percent = 0.0
+        if hasattr(os, "getloadavg"):
+            try:
+                cpu_load_percent = min(100.0, 100.0 * os.getloadavg()[0] / self._cpu_count)
+            except OSError:
+                cpu_load_percent = 0.0
+
+        sample = {
+            "cpu_process_percent": max(0.0, cpu_process_percent),
+            "cpu_load_percent": max(0.0, cpu_load_percent),
+            "gpu_util_percent": 0.0,
+            "gpu_mem_used_mb": 0.0,
+        }
+        if self.device.type == "cuda" and self._has_nvidia_smi:
+            gpu_sample = self._read_gpu_sample()
+            sample.update(gpu_sample)
+        self.samples.append(sample)
+
+    def _read_gpu_sample(self):
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=utilization.gpu,memory.used",
+                    "--format=csv,noheader,nounits",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            first = result.stdout.strip().splitlines()[0]
+            util_s, mem_s = [part.strip() for part in first.split(",", 1)]
+            return {
+                "gpu_util_percent": float(util_s),
+                "gpu_mem_used_mb": float(mem_s),
+            }
+        except Exception:
+            return {
+                "gpu_util_percent": 0.0,
+                "gpu_mem_used_mb": 0.0,
+            }
+
+    def summary(self):
+        if not self.samples:
+            return {
+                "avg_cpu_process_percent": 0.0,
+                "avg_cpu_load_percent": 0.0,
+                "avg_gpu_util_percent": 0.0,
+                "avg_gpu_mem_used_mb": 0.0,
+            }
+        count = len(self.samples)
+        return {
+            "avg_cpu_process_percent": sum(s["cpu_process_percent"] for s in self.samples) / count,
+            "avg_cpu_load_percent": sum(s["cpu_load_percent"] for s in self.samples) / count,
+            "avg_gpu_util_percent": sum(s["gpu_util_percent"] for s in self.samples) / count,
+            "avg_gpu_mem_used_mb": sum(s["gpu_mem_used_mb"] for s in self.samples) / count,
+        }
 
 
 def get_autocast_context(device):
@@ -677,9 +786,20 @@ def append_results_tsv(path, metrics):
         "yes" if metrics["signature_verified"] else "no",
         f"{metrics['energy_j_per_token']:.9f}",
         f"{metrics['tokens_per_second']:.1f}",
+        f"{metrics.get('avg_cpu_process_percent', 0.0):.1f}",
+        f"{metrics.get('avg_cpu_load_percent', 0.0):.1f}",
+        f"{metrics.get('avg_gpu_util_percent', 0.0):.1f}",
+        f"{metrics.get('avg_gpu_mem_used_mb', 0.0):.1f}",
     ]
     with open(path, "a", encoding="utf-8") as f:
         f.write("\t".join(row) + "\n")
+
+
+def maybe_write_summary_json(path, metrics):
+    if not path:
+        return
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, sort_keys=True)
 
 
 def get_git_commit():
@@ -742,15 +862,24 @@ def get_weight_decay(progress):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train autoresearch models on GPU or in CPU-native BitNet PoC mode")
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default=os.getenv("AUTORESEARCH_DEVICE", "auto"))
-    parser.add_argument("--cpu-bitnet-poc", action="store_true", default=os.getenv("AUTORESEARCH_CPU_BITNET_POC", "0") == "1")
-    parser.add_argument("--linear-impl", choices=["dense", "bitlinear"], default=os.getenv("AUTORESEARCH_LINEAR_IMPL", "dense"))
+    parser = argparse.ArgumentParser(description="Train autoresearch models in a CPU-native BitNet research loop")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda", "mps"], default=os.getenv("AUTORESEARCH_DEVICE", "cpu"))
+    parser.add_argument("--cpu-only", action="store_true", default=os.getenv("AUTORESEARCH_CPU_ONLY", "1") == "1")
+    parser.add_argument("--allow-accelerator", action="store_true", default=os.getenv("AUTORESEARCH_ALLOW_ACCELERATOR", "0") == "1")
+    parser.add_argument("--cpu-bitnet-poc", action="store_true", default=os.getenv("AUTORESEARCH_CPU_BITNET_POC", "1") == "1")
+    parser.add_argument("--linear-impl", choices=["dense", "bitlinear"], default=os.getenv("AUTORESEARCH_LINEAR_IMPL", "bitlinear"))
     parser.add_argument("--bitlinear-scaling", choices=["mean", "median"], default=os.getenv("AUTORESEARCH_BITLINEAR_SCALING", "mean"))
+    parser.add_argument("--bitlinear-threshold", type=float, default=float(os.getenv("AUTORESEARCH_BITLINEAR_THRESHOLD", "0.5")))
     parser.add_argument("--use-subln", action="store_true", default=os.getenv("AUTORESEARCH_USE_SUBLN", "0") == "1")
+    parser.add_argument("--depth", type=int, default=int(os.getenv("AUTORESEARCH_DEPTH", "0")))
+    parser.add_argument("--device-batch-size", type=int, default=int(os.getenv("AUTORESEARCH_DEVICE_BATCH_SIZE", "0")))
+    parser.add_argument("--total-batch-size", type=int, default=int(os.getenv("AUTORESEARCH_TOTAL_BATCH_SIZE", "0")))
+    parser.add_argument("--window-pattern", default=os.getenv("AUTORESEARCH_WINDOW_PATTERN", ""))
     parser.add_argument("--results-tsv", default=os.getenv("AUTORESEARCH_RESULTS_TSV", "results.tsv"))
+    parser.add_argument("--summary-json", default=os.getenv("AUTORESEARCH_SUMMARY_JSON", ""))
     parser.add_argument("--status", default=os.getenv("AUTORESEARCH_RUN_STATUS", "candidate"))
     parser.add_argument("--description", default=os.getenv("AUTORESEARCH_RUN_DESCRIPTION", ""))
+    parser.add_argument("--eval-tokens", type=int, default=int(os.getenv("AUTORESEARCH_EVAL_TOKENS", "0")))
     parser.add_argument("--avg-power-watts", type=float, default=float(os.getenv("AUTORESEARCH_AVG_POWER_WATTS", "15.0")))
     parser.add_argument("--objective", default=os.getenv("AUTORESEARCH_OBJECTIVE", ""))
     parser.add_argument("--signature", default=os.getenv("AUTORESEARCH_OBJECTIVE_SIGNATURE", ""))
@@ -762,6 +891,7 @@ def parse_args():
 def run_training(args):
     t_start = time.time()
     device = detect_device(args.device)
+    enforce_cpu_only(device, args.cpu_only and not args.allow_accelerator)
     torch.manual_seed(42)
     if device.type == "cuda":
         torch.cuda.manual_seed(42)
@@ -778,19 +908,21 @@ def run_training(args):
     linear_impl = args.linear_impl
     bitlinear_scaling = args.bitlinear_scaling
     use_subln = args.use_subln
-    depth = DEPTH
-    device_batch_size = DEVICE_BATCH_SIZE
-    total_batch_size = TOTAL_BATCH_SIZE
-    window_pattern = WINDOW_PATTERN
+    depth = args.depth or DEPTH
+    device_batch_size = args.device_batch_size or DEVICE_BATCH_SIZE
+    total_batch_size = args.total_batch_size or TOTAL_BATCH_SIZE
+    window_pattern = args.window_pattern or WINDOW_PATTERN
     description = args.description or "baseline"
+    eval_tokens = args.eval_tokens or 0
 
     if args.cpu_bitnet_poc:
         linear_impl = "bitlinear"
         use_subln = True
-        depth = CPU_POC_DEPTH
-        device_batch_size = CPU_POC_DEVICE_BATCH_SIZE
-        total_batch_size = CPU_POC_TOTAL_BATCH_SIZE
-        window_pattern = CPU_POC_WINDOW_PATTERN
+        depth = args.depth or CPU_POC_DEPTH
+        device_batch_size = args.device_batch_size or CPU_POC_DEVICE_BATCH_SIZE
+        total_batch_size = args.total_batch_size or CPU_POC_TOTAL_BATCH_SIZE
+        window_pattern = args.window_pattern or CPU_POC_WINDOW_PATTERN
+        eval_tokens = args.eval_tokens or CPU_POC_EVAL_TOKENS
         if not args.description:
             description = "cpu bitnet poc"
 
@@ -807,6 +939,7 @@ def run_training(args):
         use_subln=use_subln,
         window_pattern=window_pattern,
     )
+    config.bitlinear_threshold = args.bitlinear_threshold
     print(f"Model config: {asdict(config)}")
 
     with torch.device("meta"):
@@ -842,6 +975,7 @@ def run_training(args):
     print(f"Device: {device}")
     print(f"Time budget: {TIME_BUDGET}s")
     print(f"Gradient accumulation steps: {grad_accum_steps}")
+    print(f"Eval tokens: {eval_tokens or EVAL_TOKENS}")
     if args.objective:
         print(f"Objective: {args.objective}")
         print(f"Objective signature verified: {signature_verified}")
@@ -850,74 +984,79 @@ def run_training(args):
     smooth_train_loss = 0
     total_training_time = 0
     step = 0
+    runtime_sampler = RuntimeSampler(device)
+    runtime_sampler.start()
 
-    while True:
-        synchronize_device(device)
-        t0 = time.time()
-        for _ in range(grad_accum_steps):
-            with autocast_ctx:
-                loss = model(x, y)
-            train_loss = loss.detach()
-            loss = loss / grad_accum_steps
-            loss.backward()
-            x, y, epoch = next(train_loader)
+    try:
+        while True:
+            synchronize_device(device)
+            t0 = time.time()
+            for _ in range(grad_accum_steps):
+                with autocast_ctx:
+                    loss = model(x, y)
+                train_loss = loss.detach()
+                loss = loss / grad_accum_steps
+                loss.backward()
+                x, y, epoch = next(train_loader)
 
-        progress = min(total_training_time / TIME_BUDGET, 1.0)
-        lrm = get_lr_multiplier(progress)
-        muon_momentum = get_muon_momentum(step)
-        muon_weight_decay = get_weight_decay(progress)
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
-            if group["kind"] == "muon":
-                group["momentum"] = muon_momentum
-                group["weight_decay"] = muon_weight_decay
-        optimizer.step()
-        model.zero_grad(set_to_none=True)
+            progress = min(total_training_time / TIME_BUDGET, 1.0)
+            lrm = get_lr_multiplier(progress)
+            muon_momentum = get_muon_momentum(step)
+            muon_weight_decay = get_weight_decay(progress)
+            for group in optimizer.param_groups:
+                group["lr"] = group["initial_lr"] * lrm
+                if group["kind"] == "muon":
+                    group["momentum"] = muon_momentum
+                    group["weight_decay"] = muon_weight_decay
+            optimizer.step()
+            model.zero_grad(set_to_none=True)
 
-        train_loss_f = train_loss.item()
-        if math.isnan(train_loss_f) or train_loss_f > 100:
-            raise RuntimeError("Training diverged.")
+            train_loss_f = train_loss.item()
+            if math.isnan(train_loss_f) or train_loss_f > 100:
+                raise RuntimeError("Training diverged.")
 
-        synchronize_device(device)
-        t1 = time.time()
-        dt = t1 - t0
+            synchronize_device(device)
+            t1 = time.time()
+            dt = t1 - t0
 
-        if step > 10:
-            total_training_time += dt
+            if step > 10:
+                total_training_time += dt
 
-        ema_beta = 0.9
-        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-        debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
-        pct_done = 100 * progress
-        tok_per_sec = int(total_batch_size / max(dt, 1e-9))
-        mfu = 100 * num_flops_per_token * total_batch_size / dt / H100_BF16_PEAK_FLOPS if device.type == "cuda" else 0.0
-        remaining = max(0, TIME_BUDGET - total_training_time)
+            ema_beta = 0.9
+            smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+            debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
+            pct_done = 100 * progress
+            tok_per_sec = int(total_batch_size / max(dt, 1e-9))
+            mfu = 100 * num_flops_per_token * total_batch_size / dt / H100_BF16_PEAK_FLOPS if device.type == "cuda" else 0.0
+            remaining = max(0, TIME_BUDGET - total_training_time)
 
-        print(
-            f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
-            f"lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
-            f"mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
-            end="",
-            flush=True,
-        )
+            print(
+                f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
+                f"lrm: {lrm:.2f} | dt: {dt * 1000:.0f}ms | tok/sec: {tok_per_sec:,} | "
+                f"mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ",
+                end="",
+                flush=True,
+            )
 
-        if step == 0:
-            gc.collect()
-            gc.freeze()
-            gc.disable()
-        elif (step + 1) % 5000 == 0:
-            gc.collect()
+            if step == 0:
+                gc.collect()
+                gc.freeze()
+                gc.disable()
+            elif (step + 1) % 5000 == 0:
+                gc.collect()
 
-        step += 1
-        if step > 10 and total_training_time >= TIME_BUDGET:
-            break
+            step += 1
+            if step > 10 and total_training_time >= TIME_BUDGET:
+                break
+    finally:
+        runtime_summary = runtime_sampler.stop()
 
     print()
     total_tokens = step * total_batch_size
 
     model.eval()
     with autocast_ctx:
-        val_bpb = evaluate_bpb(model, tokenizer, device_batch_size, device=device)
+        val_bpb = evaluate_bpb(model, tokenizer, device_batch_size, device=device, eval_tokens=eval_tokens or None)
 
     t_end = time.time()
     steady_state_mfu = (
@@ -943,6 +1082,10 @@ def run_training(args):
     print(f"linear_impl:      {linear_impl}")
     print(f"energy_j/token:   {energy_j_per_token:.9f}")
     print(f"tokens_per_sec:   {tokens_per_second:.1f}")
+    print(f"cpu_proc_%:       {runtime_summary['avg_cpu_process_percent']:.1f}")
+    print(f"cpu_load_%:       {runtime_summary['avg_cpu_load_percent']:.1f}")
+    print(f"gpu_util_%:       {runtime_summary['avg_gpu_util_percent']:.1f}")
+    print(f"gpu_mem_mb_avg:   {runtime_summary['avg_gpu_mem_used_mb']:.1f}")
     print(f"signature_ok:     {signature_verified}")
 
     return {
@@ -953,9 +1096,14 @@ def run_training(args):
         "description": description,
         "device": device.type,
         "linear_impl": linear_impl,
+        "eval_tokens": eval_tokens or EVAL_TOKENS,
         "signature_verified": signature_verified,
         "energy_j_per_token": energy_j_per_token,
         "tokens_per_second": tokens_per_second,
+        "avg_cpu_process_percent": runtime_summary["avg_cpu_process_percent"],
+        "avg_cpu_load_percent": runtime_summary["avg_cpu_load_percent"],
+        "avg_gpu_util_percent": runtime_summary["avg_gpu_util_percent"],
+        "avg_gpu_mem_used_mb": runtime_summary["avg_gpu_mem_used_mb"],
     }
 
 
@@ -981,178 +1129,16 @@ def main():
                     "signature_verified": False,
                     "energy_j_per_token": 0.0,
                     "tokens_per_second": 0.0,
+                    "avg_cpu_process_percent": 0.0,
+                    "avg_cpu_load_percent": 0.0,
+                    "avg_gpu_util_percent": 0.0,
+                    "avg_gpu_mem_used_mb": 0.0,
                 },
             )
         raise
+    maybe_write_summary_json(args.summary_json, metrics)
     append_results_tsv(args.results_tsv, metrics)
 
 
 if __name__ == "__main__":
     main()
-
-tokenizer = Tokenizer.from_directory()
-vocab_size = tokenizer.get_vocab_size()
-print(f"Vocab size: {vocab_size:,}")
-
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    return GPTConfig(
-        sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
-    )
-
-config = build_model_config(DEPTH)
-print(f"Model config: {asdict(config)}")
-
-with torch.device("meta"):
-    model = GPT(config)
-model.to_empty(device=device)
-model.init_weights()
-
-param_counts = model.num_scaling_params()
-print("Parameter counts:")
-for key, value in param_counts.items():
-    print(f"  {key:24s}: {value:,}")
-num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per token: {num_flops_per_token:e}")
-
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * MAX_SEQ_LEN
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-
-optimizer = model.setup_optimizer(
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    scalar_lr=SCALAR_LR,
-    adam_betas=ADAM_BETAS,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
-)
-
-model = torch.compile(model, dynamic=False)
-
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
-
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
-
-# Schedules (all based on progress = training_time / TIME_BUDGET)
-
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
-    else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
-
-def get_muon_momentum(step):
-    frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
-
-def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
-
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-
-t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
-
-while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            loss = model(x, y)
-        train_loss = loss.detach()
-        loss = loss / grad_accum_steps
-        loss.backward()
-        x, y, epoch = next(train_loader)
-
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
-
-    train_loss_f = train_loss.item()
-
-    # Fast fail: abort if loss is exploding or NaN
-    if math.isnan(train_loss_f) or train_loss_f > 100:
-        print("FAIL")
-        exit(1)
-
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
-
-    if step > 10:
-        total_training_time += dt
-
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / H100_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
-
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | epoch: {epoch} | remaining: {remaining:.0f}s    ", end="", flush=True)
-
-    # GC management (Python's GC causes ~500ms stalls)
-    if step == 0:
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
-
-    step += 1
-
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
-
-print()  # newline after \r training log
-
-total_tokens = step * TOTAL_BATCH_SIZE
-
-# Final eval
-model.eval()
-with autocast_ctx:
-    val_bpb = evaluate_bpb(model, tokenizer, DEVICE_BATCH_SIZE)
-
-# Final summary
-t_end = time.time()
-startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / H100_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-
-print("---")
-print(f"val_bpb:          {val_bpb:.6f}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")

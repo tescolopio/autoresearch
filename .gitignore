@@ -21,3 +21,11 @@ dev/
 
 # Results file
 results.tsv
+
+# Local research loop runtime artifacts
+.ternary_lab/
+comparison_reports/cpu_bitnet.json
+comparison_reports/cpu_bitnet.log
+comparison_reports/cpu_bitnet.tsv
+comparison_reports/latest/
+provider_reports/latest/

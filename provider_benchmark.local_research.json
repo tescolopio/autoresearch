@@ -1,0 +1,26 @@
+{
+    "providers": [{
+        "name": "bitnet-local",
+        "type": "local-command",
+        "command": "python scripts/bitnet_local_stub.py",
+        "system_prompt": "Act as a local CPU-only research assistant. Answer concisely.",
+        "temperature": 0.0,
+        "max_tokens": 256
+    }],
+    "tasks": [{
+            "id": "research-reliability-1",
+            "prompt": "Describe a three-step procedure for safely starting a local CPU-only BitNet experiment branch before a training run. Mention git status, a dedicated branch, and log capture.",
+            "must_contain": ["1", "2", "3"]
+        },
+        {
+            "id": "research-recovery-1",
+            "prompt": "A CPU-only BitNet run failed after an experiment commit. Explain how to preserve history while undoing the failed change. Mention revert commit, local-only constraints, and checking the run log.",
+            "must_contain": ["revert", "log"]
+        },
+        {
+            "id": "research-planning-1",
+            "prompt": "Give a three-step plan to improve the reliability and capability of a local research agent over successive 5-minute CPU-native BitNet runs.",
+            "must_contain": ["1", "2", "3"]
+        }
+    ]
+}

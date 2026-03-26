@@ -59,16 +59,23 @@ class BitNetCpuPocTests(unittest.TestCase):
 
     def test_train_exposes_cpu_bitnet_cli_and_bitlinear_mode(self):
         self.assertIn("--cpu-bitnet-poc", self.train_source)
+        self.assertIn("--cpu-only", self.train_source)
+        self.assertIn("--summary-json", self.train_source)
+        self.assertIn("--eval-tokens", self.train_source)
         self.assertIn('choices=["dense", "bitlinear"]', self.train_source)
         self.assertIn("class BitLinear", self.train_source)
+        self.assertIn('AUTORESEARCH_DEVICE", "cpu"', self.train_source)
+        self.assertIn('AUTORESEARCH_LINEAR_IMPL", "bitlinear"', self.train_source)
+        self.assertIn("CPU_POC_EVAL_TOKENS", self.train_source)
 
     def test_prepare_supports_device_aware_dataloader_and_eval(self):
         make_dataloader = self.get_function_def(self.prepare_tree, "make_dataloader")
         evaluate_bpb = self.get_function_def(self.prepare_tree, "evaluate_bpb")
         self.assertEqual([arg.arg for arg in make_dataloader.args.args][-1], "device")
         self.assertEqual(ast.literal_eval(make_dataloader.args.defaults[-1]), "cuda")
-        self.assertEqual([arg.arg for arg in evaluate_bpb.args.args][-1], "device")
-        self.assertEqual(ast.literal_eval(evaluate_bpb.args.defaults[-1]), "cuda")
+        self.assertEqual([arg.arg for arg in evaluate_bpb.args.args][-2:], ["device", "eval_tokens"])
+        self.assertEqual(ast.literal_eval(evaluate_bpb.args.defaults[-2]), "cuda")
+        self.assertIsNone(ast.literal_eval(evaluate_bpb.args.defaults[-1]))
         self.assertIn('device_buffer is not None', self.prepare_source)
 
     def test_signature_verification_accepts_valid_hmac(self):
@@ -101,6 +108,10 @@ class BitNetCpuPocTests(unittest.TestCase):
                     "signature_verified": True,
                     "energy_j_per_token": 0.000123456,
                     "tokens_per_second": 42.0,
+                    "avg_cpu_process_percent": 85.0,
+                    "avg_cpu_load_percent": 65.0,
+                    "avg_gpu_util_percent": 0.0,
+                    "avg_gpu_mem_used_mb": 0.0,
                 },
             )
             with open(path, "r", encoding="utf-8") as f:
@@ -108,6 +119,8 @@ class BitNetCpuPocTests(unittest.TestCase):
             self.assertEqual(len(lines), 2)
             self.assertIn("energy_j_per_token", lines[0])
             self.assertIn("tokens_per_second", lines[0])
+            self.assertIn("avg_cpu_process_percent", lines[0])
+            self.assertIn("avg_gpu_util_percent", lines[0])
             self.assertIn("bitlinear", lines[1])
             self.assertIn("yes", lines[1])
             self.assertNotIn("\n", lines[1])
